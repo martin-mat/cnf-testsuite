@@ -1,0 +1,111 @@
+name: Debug MongoDB chaos
+on:
+  push:
+    branches: [debug-mongo-chaos]
+jobs:
+  debug:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      KIND_CLUSTER_NAME: mongo-debug
+    steps:
+      - name: Checkout Code & Submodules
+        uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+      - name: Cache the suite tools
+        uses: ./.github/actions/cache-suite-tools
+      - name: Login to Docker Hub
+        if: false
+        uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_PASSWORD }}
+      # kind nodes share the host kernel, so building the out-of-tree module on
+      # the runner is enough for the UPF pods to load it.
+      - name: Build and load the gtp5g kernel module
+        if: false
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential "linux-headers-$(uname -r)"
+          git clone --depth 1 https://github.com/free5gc/gtp5g.git "$RUNNER_TEMP/gtp5g"
+          make -C "$RUNNER_TEMP/gtp5g" -j"$(nproc)"
+          sudo make -C "$RUNNER_TEMP/gtp5g" install
+          sudo modprobe gtp5g
+          lsmod | grep -q '^gtp5g' && echo "gtp5g loaded on kernel $(uname -r)"
+      - name: Install kind
+        uses: ./.github/actions/install-kind
+      - name: Setup Kind Cluster
+        run: |
+          # The unsafe sysctls are what free5GC's UPF needs; they cost the
+          # other CNFs nothing.
+          cat <<EOF > kind_setup.yaml
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            kubeadmConfigPatches:
+            - |
+              kind: KubeletConfiguration
+              allowedUnsafeSysctls:
+                - "net.ipv4.ip_forward"
+                - "net.ipv4.conf.all.forwarding"
+            - |
+              kind: ClusterConfiguration
+              etcd:
+                local:
+                  dataDir: /tmp/etcd
+            extraMounts:
+            - containerPath: /var/lib/kubelet/config.json
+              hostPath: $HOME/.docker/config.json
+          - role: worker
+            kubeadmConfigPatches:
+            - |
+              kind: KubeletConfiguration
+              allowedUnsafeSysctls:
+                - "net.ipv4.ip_forward"
+                - "net.ipv4.conf.all.forwarding"
+            extraMounts:
+            - containerPath: /var/lib/kubelet/config.json
+              hostPath: $HOME/.docker/config.json
+          - role: worker
+            kubeadmConfigPatches:
+            - |
+              kind: KubeletConfiguration
+              allowedUnsafeSysctls:
+                - "net.ipv4.ip_forward"
+                - "net.ipv4.conf.all.forwarding"
+            extraMounts:
+            - containerPath: /var/lib/kubelet/config.json
+              hostPath: $HOME/.docker/config.json
+          EOF
+          kind create cluster --name "$KIND_CLUSTER_NAME" --config kind_setup.yaml --wait 5m
+      - name: Install the CNTi toolchain
+        # Provisions the Crystal, kubectl and helm the suite needs with no
+        # baked tooling, so the job runs identically on GitHub-hosted runners
+        # and on a plain upstream self-hosted runner image. install-crystal@v1
+        # requires a runner agent that speaks node24 (>= 2.327.1).
+        uses: ./.github/actions/install-cnti-toolchain
+      - name: Build CNTi Test Suite
+        run: |
+          shards install
+          crystal build src/cnti-testsuite.cr
+      - name: Install the CNF and run pod_delete, dumping the namespace meanwhile
+        run: |
+          ./cnti-testsuite setup
+          ./cnti-testsuite cnf_install --cnf-config ./example-cnfs/mongodb-operator/cnti-testsuite.yaml
+          kubectl get pods -A -o wide
+          (while true; do sleep 45; echo "=== $(date -u +%T)"; kubectl get pods -n mongodb -o wide; for p in $(kubectl get pods -n mongodb --field-selector=status.phase=Pending -o name); do kubectl describe -n mongodb "$p" | sed -n '/^Containers:/,$p' | grep -v -E '^\s+(/|KUBERNETES|POD_|LIB_)' ; done; done) &
+          CNTI_TESTSUITE_LOG_LEVEL=INFO ./cnti-testsuite node_drain || true
+          echo "=== after install"; df -h / /tmp
+          echo "=== after node_drain"; df -h / /tmp; kubectl get pods -A -o wide; kubectl get nodes; kubectl get pv -o wide
+          for c in security configuration observability microservice; do CNTI_TESTSUITE_LOG_LEVEL=INFO ./cnti-testsuite $c || true; echo "=== after $c"; for n in mongo-debug-worker mongo-debug-worker2; do docker exec $n df -h /tmp /var || true; done; done
+          CNTI_TESTSUITE_LOG_LEVEL=INFO ./cnti-testsuite pod_delete || true
+          kill %1 || true
+      - name: Final dump
+        if: always()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get events -n mongodb --sort-by=.lastTimestamp | tail -80 || true
+          kubectl describe nodes | grep -A12 -E "^(Name:|Allocated resources)" || true
