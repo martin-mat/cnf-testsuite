@@ -1,0 +1,26 @@
+name: OCUDU gNB without a service account token
+on:
+  push:
+    branches: [debug-ocudu-sa]
+permissions:
+  contents: read
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        tests: [cert, service_account_mapping]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: The chart change, from the GitLab fork
+        run: |
+          git clone -q --depth 1 --branch gnb-no-sa-token https://gitlab.com/martin-matyas/ocudu_helm.git .
+          git log -1 --format='%h %s'
+      - uses: lfn-cnti/testsuite-action@v1
+        with:
+          version: v2.2.0
+          cnf_config: .gitlab/cnti/ocudu-gnb/cnti-testsuite.yaml
+          log_level: info
+          install_timeout: 900
+          tests: ${{ matrix.tests }}
